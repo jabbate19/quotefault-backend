@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT quotes.id AS \"quote_id!\",\n            reports.timestamp AS \"report_timestamp!\", reports.id AS \"report_id!\",\n            reports.reason AS \"report_reason!\"\n            FROM quotes\n            LEFT JOIN reports ON reports.quote_id = quotes.id\n            WHERE reports.resolver IS NULL\n            ORDER BY quotes.id, reports.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "quote_id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "report_timestamp!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 2,
+        "name": "report_id!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "report_reason!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2c75022c896d85ebb01222d155f1653c7167e05f6640c5f1cb4e2c1480d23cb9"
+}

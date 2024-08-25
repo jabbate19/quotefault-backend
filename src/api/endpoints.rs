@@ -11,7 +11,7 @@ use actix_web::{
 };
 use log::{log, Level};
 use sha3::{Digest, Sha3_256};
-use sqlx::{query, query_as, Connection, Postgres, Transaction};
+use sqlx::{query, query_as, Connection, Postgres, QueryBuilder, Transaction};
 
 use crate::{
     api::{
@@ -27,19 +27,21 @@ use crate::{
             ReportResponse, ReportedQuoteResponse, ResolveParams, UserResponse, VersionResponse,
             VoteParams,
         },
-        db::{QuoteShard, ReportedQuoteShard, Vote, ID},
+        db::{ReportedQuote, Quote, Vote, ID},
     },
     utils::is_valid_username,
 };
 
-async fn shards_to_quotes(
-    shards: &[QuoteShard],
+async fn populate_user_data(
+    quotes: &[Quote],
     ldap: &ldap::client::LdapClient,
 ) -> Result<Vec<QuoteResponse>, HttpResponse> {
     let mut uid_map: HashMap<String, Option<String>> = HashMap::new();
-    shards.iter().for_each(|x| {
-        uid_map.insert(x.submitter.clone(), None);
-        uid_map.insert(x.speaker.clone(), None);
+    quotes.iter().for_each(|x| {
+        x.shards.iter().for_each(|s| {
+            uid_map.insert(x.submitter.clone(), None);
+            uid_map.insert(s.speaker.clone(), None);
+        });
         if let Some(hidden_actor) = &x.hidden_actor {
             uid_map.insert(hidden_actor.clone(), None);
         }
@@ -56,62 +58,59 @@ async fn shards_to_quotes(
         Err(err) => return Err(HttpResponse::InternalServerError().body(err.to_string())),
     }
 
-    let mut quotes: Vec<QuoteResponse> = Vec::new();
-    for shard in shards {
-        let speaker = match uid_map.get(&shard.speaker).cloned().unwrap() {
-            Some(cn) => UserResponse {
-                uid: shard.speaker.clone(),
-                cn,
-            },
-            None => continue,
-        };
-        if shard.index == 1 {
-            let submitter = match uid_map.get(&shard.submitter).cloned().unwrap() {
-                Some(cn) => UserResponse {
-                    uid: shard.submitter.clone(),
-                    cn,
-                },
-                None => continue,
-            };
-            let hidden_actor = shard.hidden_actor.as_ref().and_then(|hidden_actor| {
-                uid_map
-                    .get(hidden_actor)
-                    .cloned()
+    Ok(quotes
+        .iter()
+        .map(|quote| QuoteResponse {
+            id: quote.id,
+            submitter: UserResponse {
+                uid: quote.submitter.clone(),
+                cn: uid_map
+                    .get(&quote.submitter)
+                    .as_ref()
                     .unwrap()
-                    .map(|cn| UserResponse {
-                        uid: hidden_actor.clone(),
-                        cn,
-                    })
-            });
-            quotes.push(QuoteResponse {
-                id: shard.id,
-                shards: vec![QuoteShardResponse {
-                    body: shard.body.clone(),
-                    speaker,
-                }],
-                timestamp: shard.timestamp,
-                score: shard.score,
-                vote: shard.vote.clone(),
-                submitter,
-                hidden: hidden_actor.clone().and_then(|actor| {
-                    Some(Hidden {
-                        actor,
-                        reason: shard.hidden_reason.clone()?,
-                    })
-                }),
-                favorited: shard.favorited,
-            });
-        } else {
-            quotes.last_mut().unwrap().shards.push(QuoteShardResponse {
-                body: shard.body.clone(),
-                speaker,
-            });
-        }
-    }
-    Ok(quotes)
+                    .as_ref()
+                    .unwrap()
+                    .to_string(),
+            },
+            timestamp: quote.timestamp,
+            score: quote.score,
+            vote: quote.vote.clone(),
+            hidden: quote.hidden_actor.as_ref().map(|actor| Hidden {
+                reason: quote.hidden_reason.as_ref().unwrap().to_string(),
+                actor: UserResponse {
+                    uid: actor.to_string(),
+                    cn: uid_map
+                        .get(actor)
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .to_string(),
+                },
+            }),
+            favorited: quote.favorited,
+            shards: quote
+                .shards
+                .iter()
+                .map(|s| QuoteShardResponse {
+                    speaker: UserResponse {
+                        uid: s.speaker.clone(),
+                        cn: uid_map
+                            .get(&s.speaker)
+                            .as_ref()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .to_string(),
+                    },
+                    body: s.body.clone(),
+                })
+                .collect(),
+        })
+        .collect())
 }
 
-fn format_reports(quotes: &[ReportedQuoteShard]) -> Vec<ReportedQuoteResponse> {
+fn format_reports(quotes: &[ReportedQuote]) -> Vec<ReportedQuoteResponse> {
     let mut reported_quotes: HashMap<i32, ReportedQuoteResponse> = HashMap::new();
     for quote in quotes {
         match reported_quotes.get_mut(&quote.quote_id) {
@@ -276,23 +275,27 @@ pub async fn create_quote(
     }
     log!(Level::Trace, "created a new entry in quote table");
 
-    let ids: Vec<i32> = vec![id; body.shards.len()];
-    let indices: Vec<i16> = (1..=body.shards.len()).map(|a| a as i16).collect();
-    let bodies: Vec<String> = body.shards.iter().map(|s| s.body.clone()).collect();
-    let speakers: Vec<String> = body.shards.iter().map(|s| s.speaker.clone()).collect();
+    let shards = body
+        .shards
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (id, i as i32, s.body.clone(), s.speaker.clone()));
+
+    let mut sql_query = QueryBuilder::new("INSERT INTO Shards (quote_id, index, body, speaker) ");
+
+    sql_query.push_values(shards, |mut b, shard| {
+        b.push_bind(shard.0)
+            .push_bind(shard.1)
+            .push_bind(shard.2)
+            .push_bind(shard.3);
+    });
 
     match log_query(
-        query!(
-            "INSERT INTO Shards (quote_id, index, body, speaker)
-            SELECT quote_id, index, body, speaker
-            FROM UNNEST($1::int4[], $2::int2[], $3::text[], $4::varchar[]) as a(quote_id, index, body, speaker)",
-            ids.as_slice(),
-            indices.as_slice(),
-            bodies.as_slice(),
-            speakers.as_slice()
-        )
-        .execute(&mut *transaction)
-        .await, Some(transaction)).await {
+        sql_query.build().execute(&mut *transaction).await,
+        Some(transaction),
+    )
+    .await
+    {
         Ok((tx, _)) => transaction = tx.unwrap(),
         Err(res) => return res,
     }
@@ -332,9 +335,10 @@ pub async fn delete_quote(state: Data<AppState>, path: Path<(i32,)>, user: User)
 
     match log_query(
         query!(
-            "DELETE FROM quotes WHERE id = $1 AND submitter = $2",
+            "DELETE FROM quotes WHERE id = $1 AND (submitter = $2 OR $3)",
             id,
-            user.preferred_username
+            user.preferred_username,
+            user.admin() || !*SECURITY_ENABLED
         )
         .execute(&mut *transaction)
         .await,
@@ -451,75 +455,52 @@ pub async fn report_quote(
 pub async fn get_quote(state: Data<AppState>, path: Path<(i32,)>, user: User) -> impl Responder {
     let (id,) = path.into_inner();
 
+    let mut sql_query = QueryBuilder::new(
+        "SELECT quotes.id as \"id\",
+            json_agg(shards.*) as \"shards\",
+            quotes.submitter as \"submitter\",
+            quotes.timestamp as \"timestamp\",
+            hidden.reason as \"hidden_reason\",
+            hidden.actor as \"hidden_actor\",
+            uservote.vote as \"vote\",
+            COUNT(DISTINCT upvotes.*) - COUNT(DISTINCT downvotes.*) AS \"score\",
+            COUNT(DISTINCT favorites.*) > 0 AS \"favorited\"
+            FROM quotes
+            JOIN shards ON quotes.id = shards.quote_id
+            LEFT JOIN hidden ON quotes.id = hidden.quote_id
+            LEFT JOIN votes upvotes ON quotes.id = upvotes.quote_id AND upvotes.vote = 'upvote'
+            LEFT JOIN votes downvotes ON quotes.id = upvotes.quote_id AND upvotes.vote = 'downvote'
+            LEFT JOIN votes uservote ON quotes.id = uservote.quote_id and uservote.submitter = ",
+    );
+    sql_query.push_bind(&user.preferred_username);
+    sql_query
+        .push("LEFT JOIN favorites ON quotes.id = favorites.quote_id AND favorites.username = ");
+    sql_query.push_bind(&user.preferred_username);
+    sql_query.push("WHERE quotes.id = ");
+    sql_query.push_bind(id);
+    sql_query.push("GROUP by quotes.id, hidden.reason, hidden.actor, uservote.vote");
+
     match log_query_as(
-        query_as!(
-            QuoteShard,
-            "SELECT pq.id as \"id!\", s.index as \"index!\", pq.submitter as \"submitter!\",
-            pq.timestamp as \"timestamp!\", s.body as \"body!\", s.speaker as \"speaker!\",
-            hidden.reason as \"hidden_reason: Option<String>\", hidden.actor as \"hidden_actor: Option<String>\", 
-            v.vote as \"vote: Option<Vote>\",
-            (CASE WHEN t.score IS NULL THEN 0 ELSE t.score END) AS \"score!\",
-            (CASE WHEN f.username IS NULL THEN FALSE ELSE TRUE END) AS \"favorited!\"
-            FROM (
-                SELECT * FROM quotes q
-                WHERE q.id = $1
-                AND CASE
-                    WHEN $3 THEN TRUE
-                    ELSE (CASE
-                        WHEN q.id IN (SELECT quote_id FROM hidden) AND
-                        (q.submitter=$2 OR $2 IN (
-                            SELECT speaker FROM shards
-                            WHERE quote_id=q.id))
-                        THEN TRUE
-                        ELSE q.id NOT IN (SELECT quote_id FROM hidden)
-                    END)
-                END
-                ORDER BY q.id DESC
-            ) AS pq
-            LEFT JOIN hidden ON hidden.quote_id = pq.id
-            LEFT JOIN shards s ON s.quote_id = pq.id
-            LEFT JOIN (
-                SELECT quote_id, vote FROM votes
-                WHERE submitter=$2
-            ) v ON v.quote_id = pq.id
-            LEFT JOIN (
-                SELECT
-                    quote_id,
-                    SUM(
-                        CASE
-                            WHEN vote='upvote' THEN 1 
-                            WHEN vote='downvote' THEN -1
-                            ELSE 0
-                        END
-                    ) AS score
-                FROM votes
-                GROUP BY quote_id
-            ) t ON t.quote_id = pq.id
-            LEFT JOIN (
-                SELECT quote_id, username FROM favorites
-                WHERE username=$2
-            ) f ON f.quote_id = pq.id
-            ORDER BY timestamp DESC, pq.id DESC, s.index",
-            id,
-            user.preferred_username,
-            user.admin() || !*SECURITY_ENABLED,
-        )
-        .fetch_all(&state.db)
-        .await,
+        sql_query
+            .build_query_as::<Quote>()
+            .fetch_all(&state.db)
+            .await,
         None,
     )
     .await
     {
-        Ok((_, shards)) => {
-            if shards.is_empty() {
-                HttpResponse::NotFound().body("Quote could not be found")
-            } else {
-                match shards_to_quotes(shards.as_slice(), &state.ldap).await {
-                    Ok(quotes) => HttpResponse::Ok().json(quotes.get(0).unwrap()),
+        Ok((_, mut quote_vec)) => match quote_vec.pop() {
+            Some(quote) => {
+                if quote.hidden_actor.is_some() && (!user.admin() && *SECURITY_ENABLED) {
+                    return HttpResponse::Unauthorized().body("This quote is hidden");
+                }
+                match populate_user_data(&Vec::from([quote]), &state.ldap).await {
+                    Ok(resp_data) => HttpResponse::Ok().json(resp_data.first().unwrap()),
                     Err(res) => res,
                 }
             }
-        }
+            None => HttpResponse::NotFound().body("Quote could not be found"),
+        },
         Err(res) => res,
     }
 }
@@ -633,111 +614,92 @@ pub async fn get_quotes(
         .limit
         .map(|x| if x == -1 { i64::MAX } else { x })
         .unwrap_or(10);
-    let lt_qid: i32 = params.lt.unwrap_or(0);
-    let query = params
-        .q
-        .clone()
-        .map_or("%".to_string(), |q| format!("%{q}%"));
-    let speaker = params.speaker.clone().unwrap_or("%".to_string());
-    let submitter = params.submitter.clone().unwrap_or("%".to_string());
-    let involved = params.involved.clone().unwrap_or("%".to_string());
-    let hidden = params.hidden.unwrap_or(false);
-    let filter_by_hidden = params.hidden.is_some();
-    let favorited = params.favorited.unwrap_or(false);
+    let mut sql_query = QueryBuilder::new(
+        "SELECT quotes.id as \"id\",
+            json_agg(shards.*) as \"shards\",
+            quotes.submitter as \"submitter\",
+            quotes.timestamp as \"timestamp\",
+            hidden.reason as \"hidden_reason\",
+            hidden.actor as \"hidden_actor\",
+            uservote.vote as \"vote\",
+            COUNT(DISTINCT upvotes.*) - COUNT(DISTINCT downvotes.*) AS \"score\",
+            COUNT(DISTINCT favorites.*) > 0 AS \"favorited\"
+            FROM quotes
+            JOIN shards ON quotes.id = shards.quote_id
+            LEFT JOIN hidden ON quotes.id = hidden.quote_id
+            LEFT JOIN votes upvotes ON quotes.id = upvotes.quote_id AND upvotes.vote = 'upvote'
+            LEFT JOIN votes downvotes ON quotes.id = upvotes.quote_id AND upvotes.vote = 'downvote'
+            LEFT JOIN votes uservote ON quotes.id = uservote.quote_id and uservote.submitter = ",
+    );
+    sql_query.push_bind(&user.preferred_username);
+    sql_query
+        .push("LEFT JOIN favorites ON quotes.id = favorites.quote_id AND favorites.username = ");
+    sql_query.push_bind(&user.preferred_username);
+    sql_query.push("WHERE 1=1");
+    if let Some(lt) = params.lt {
+        sql_query.push("AND quotes.id < ");
+        sql_query.push_bind(lt);
+    }
+    if let Some(query) = &params.q {
+        sql_query.push("AND shards.body LIKE ");
+        sql_query.push_bind(format!("%{query}%"));
+    }
+    if let Some(speaker) = &params.speaker {
+        sql_query.push("AND shards.speaker = ");
+        sql_query.push_bind(speaker);
+    }
+    if let Some(submitter) = &params.submitter {
+        sql_query.push("AND quotes.submitter = ");
+        sql_query.push_bind(submitter);
+    }
+    if let Some(involved) = &params.involved {
+        sql_query.push("AND (quotes.submitter = ");
+        sql_query.push_bind(involved);
+        sql_query.push("OR shards.speaker = ");
+        sql_query.push_bind(involved);
+        sql_query.push(")");
+    }
+    match params.hidden {
+        Some(true) => {
+            sql_query.push("AND hidden.reason IS NOT NULL");
+            if !user.admin() && *SECURITY_ENABLED {
+                sql_query.push("AND (submitter =");
+                sql_query.push_bind(&user.preferred_username);
+                sql_query.push("OR submitter = ");
+                sql_query.push_bind(&user.preferred_username);
+                sql_query.push(")");
+            }
+        }
+        Some(false) => {
+            sql_query.push("AND hidden.reason IS NULL");
+        }
+        None => {}
+    }
+    match params.favorited {
+        Some(true) => {
+            sql_query.push("AND COUNT(favorites.*) = 1");
+        }
+        Some(false) => {
+            sql_query.push("AND COUNT(favorites.*) = 0");
+        }
+        None => {}
+    }
+    sql_query.push(
+        "GROUP by quotes.id, hidden.reason, hidden.actor, uservote.vote
+			ORDER BY quotes.id DESC
+			LIMIT ",
+    );
+    sql_query.push_bind(limit);
     match log_query_as(
-        query_as!(
-            QuoteShard,
-            "SELECT pq.id as \"id!\", s.index as \"index!\", pq.submitter as \"submitter!\",
-            pq.timestamp as \"timestamp!\", s.body as \"body!\", s.speaker as \"speaker!\",
-            hidden.reason as \"hidden_reason: Option<String>\",
-            hidden.actor as \"hidden_actor: Option<String>\", v.vote as \"vote: Option<Vote>\",
-            (CASE WHEN t.score IS NULL THEN 0 ELSE t.score END) AS \"score!\",
-            (CASE WHEN f.username IS NULL THEN FALSE ELSE TRUE END) AS \"favorited!\"
-            FROM (
-                SELECT * FROM (
-                    SELECT id, submitter, timestamp,
-                        (CASE WHEN quote_id IS NOT NULL THEN TRUE ELSE FALSE END) AS hidden
-                    FROM quotes as _q
-                    LEFT JOIN (SELECT quote_id FROM hidden) _h ON _q.id = _h.quote_id
-                ) as q
-                WHERE CASE
-                    WHEN $7 AND $6 AND $9 THEN q.hidden
-                    WHEN $7 AND $6 THEN CASE
-                        WHEN (q.submitter=$8 
-                            OR $8 IN (SELECT speaker FROM shards WHERE quote_id=q.id))
-                            THEN q.hidden 
-                        ELSE FALSE
-                    END
-                    WHEN $7 AND NOT $6 THEN NOT q.hidden
-                    ELSE (CASE WHEN q.hidden AND
-                        (q.submitter=$8 OR $8 IN (
-                            SELECT speaker FROM shards
-                            WHERE quote_id=q.id)) THEN q.hidden ELSE NOT q.hidden END)
-                END
-                AND CASE WHEN $2::int4 > 0 THEN q.id < $2::int4 ELSE true END
-                AND submitter LIKE $5
-                AND (submitter LIKE $10 OR q.id IN (SELECT quote_id FROM shards s WHERE speaker LIKE $10))
-                AND q.id IN (
-                    SELECT quote_id FROM shards
-                    WHERE body ILIKE $3
-                    AND speaker LIKE $4
-                )
-                AND CASE
-                    WHEN $11 THEN q.id IN (
-                        SELECT quote_id FROM favorites
-                        WHERE username=$8
-                    )
-                    ELSE TRUE
-                END
-                ORDER BY q.id DESC
-                LIMIT $1
-            ) AS pq
-            LEFT JOIN hidden ON hidden.quote_id = pq.id
-            LEFT JOIN shards s ON s.quote_id = pq.id
-            LEFT JOIN (
-                SELECT quote_id, vote FROM votes
-                WHERE submitter=$8
-            ) v ON v.quote_id = pq.id
-            LEFT JOIN (
-                SELECT
-                    quote_id,
-                    SUM(
-                        CASE
-                            WHEN vote='upvote' THEN 1 
-                            WHEN vote='downvote' THEN -1
-                            ELSE 0
-                        END
-                    ) AS score
-                FROM votes
-                GROUP BY quote_id
-            ) t ON t.quote_id = pq.id
-            LEFT JOIN (
-                SELECT quote_id, username FROM favorites
-                WHERE username=$8
-            ) f ON f.quote_id = pq.id
-            ORDER BY timestamp DESC, pq.id DESC, s.index",
-            limit, // $1
-            lt_qid, // $2
-            query, // $3
-            speaker, // $4
-            submitter, // $5
-            hidden, // $6
-            filter_by_hidden, // $7
-            user.preferred_username, // $8
-            user.admin() || !*SECURITY_ENABLED, // $9
-            involved, // $10
-            favorited, // $11
-        )
-        .fetch_all(&state.db)
-        .await,
+        sql_query
+            .build_query_as::<Quote>()
+            .fetch_all(&state.db)
+            .await,
         None,
     )
     .await
     {
-        Ok((_, shards)) => match shards_to_quotes(shards.as_slice(), &state.ldap).await {
-            Ok(quotes) => HttpResponse::Ok().json(quotes),
-            Err(response) => response,
-        },
+        Ok((_, data)) => HttpResponse::Ok().json(data),
         Err(res) => res,
     }
 }
@@ -762,25 +724,14 @@ pub async fn get_users(state: Data<AppState>) -> impl Responder {
 pub async fn get_reports(state: Data<AppState>) -> impl Responder {
     match log_query_as(
         query_as!(
-            ReportedQuoteShard,
-            "SELECT pq.id AS \"quote_id!\", pq.submitter AS \"quote_submitter!\",
-            pq.timestamp AS \"quote_timestamp!\", pq.hidden AS \"quote_hidden!\", 
-            r.timestamp AS \"report_timestamp!\", r.id AS \"report_id!\",
-            r.reason AS \"report_reason!\", r.resolver AS \"report_resolver\"
-            FROM (
-                SELECT * FROM (
-                    SELECT id, submitter, timestamp,
-                        (CASE WHEN quote_id IS NOT NULL THEN TRUE ELSE FALSE END) AS hidden
-                    FROM quotes as _q
-                    LEFT JOIN (SELECT quote_id FROM hidden) _h ON _q.id = _h.quote_id
-                ) as q
-                WHERE q.id IN (
-                    SELECT quote_id FROM reports r
-                    WHERE r.resolver IS NULL
-                )
-            ) AS pq
-            LEFT JOIN reports r ON r.quote_id = pq.id WHERE r.resolver IS NULL
-            ORDER BY pq.id, r.id"
+            ReportedQuote,
+            "SELECT quotes.id AS \"quote_id!\",
+            reports.timestamp AS \"report_timestamp!\", reports.id AS \"report_id!\",
+            reports.reason AS \"report_reason!\"
+            FROM quotes
+            LEFT JOIN reports ON reports.quote_id = quotes.id
+            WHERE reports.resolver IS NULL
+            ORDER BY quotes.id, reports.id"
         )
         .fetch_all(&state.db)
         .await,

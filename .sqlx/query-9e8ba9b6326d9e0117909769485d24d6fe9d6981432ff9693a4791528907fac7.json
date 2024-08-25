@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM quotes WHERE id = $1 AND (submitter = $2 OR $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Text",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9e8ba9b6326d9e0117909769485d24d6fe9d6981432ff9693a4791528907fac7"
+}
